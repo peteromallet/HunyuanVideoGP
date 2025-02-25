@@ -15,6 +15,8 @@ from hyvideo.config import parse_args
 from hyvideo.inference import HunyuanVideoSampler
 from hyvideo.constants import NEGATIVE_PROMPT
 from hyvideo.modules.attenion import get_attention_modes
+from hyvideo.modules.models import get_linear_split_map
+
 from mmgp import offload, safetensors2, profile_type 
 import torch
 import gc
@@ -41,12 +43,13 @@ text_encoder_choices = ["ckpts/text_encoder/llava-llama-3-8b-v1_1_fp16.safetenso
 server_config_filename = "gradio_config.json"
 
 if not Path(server_config_filename).is_file():
-    server_config = {"attention_mode" : "sdpa",  
+    server_config = {"attention_mode" : "auto",  
                      "transformer_filename": transformer_choices_t2v[1], 
                      "transformer_filename_i2v": transformer_choices_i2v[1],  ########
                      "text_encoder_filename" : text_encoder_choices[1],
                      "compile" : "",
                      "default_ui": "t2v",
+                     "vae_config": 0,
                      "profile" : profile_type.LowRAM_LowVRAM }
 
     with open(server_config_filename, "w", encoding="utf-8") as writer:
@@ -63,7 +66,7 @@ transformer_filename_i2v = server_config.get("transformer_filename_i2v", transfo
 text_encoder_filename = server_config["text_encoder_filename"]
 attention_mode = server_config["attention_mode"]
 if len(args.attention)> 0:
-    if args.attention in ["sdpa", "sage", "flash", "xformers"]:
+    if args.attention in ["auto", "sdpa", "sage", "sage2", "flash", "xformers"]:
         attention_mode = args.attention
         lock_ui_attention = True
     else:
@@ -71,6 +74,10 @@ if len(args.attention)> 0:
 
 profile =  force_profile_no if force_profile_no >=0 else server_config["profile"]
 compile = server_config.get("compile", "")
+vae_config = server_config.get("vae_config", 0)
+if len(args.vae_config) > 0:
+    vae_config = int(args.vae_config)
+
 default_ui = server_config.get("default_ui", "t2v") 
 use_image2video = default_ui != "t2v"
 if args.t2v:
@@ -81,16 +88,17 @@ if args.i2v:
 if use_image2video:
     lora_preselected =args.lora_weight_i2v
     lora_dir =args.lora_dir_i2v
-    lora_preseleted_multiplier = [float(i) for i in args.lora_multiplier_i2v ]
+    lora_preseleted_multiplier = args.lora_multiplier
+
 else:
     lora_preselected =args.lora_weight
     lora_dir =args.lora_dir
-    lora_preseleted_multiplier  = [float(i) for i in args.lora_multiplier ]
+    lora_preseleted_multiplier  = args.lora_multiplier
 
 default_tea_cache = 0
 if args.fast or args.fastest:
     transformer_filename_t2v = transformer_choices_t2v[2]
-    attention_mode="sage"
+    attention_mode="sage2" if "sage2" in attention_modes_supported else "sage"
     default_tea_cache = 0.15
     lock_ui_attention = True
     lock_ui_transformer = True
@@ -109,6 +117,7 @@ fast_hunyan = "fast" in transformer_filename_t2v
 #text_encoder_filename = "ckpts/text_encoder/llava-llama-3-8b-v1_1_quanto_int8.safetensors"
 
 #attention_mode="sage"
+#attention_mode="sage2"
 #attention_mode="flash"
 #attention_mode="sdpa"
 #attention_mode="xformers"
@@ -126,7 +135,7 @@ def download_models(transformer_filename, text_encoder_filename):
     from huggingface_hub import hf_hub_download, snapshot_download    
     repoId = "DeepBeepMeep/HunyuanVideo" 
     sourceFolderList = ["text_encoder_2", "text_encoder", "hunyuan-video-t2v-720p/vae", "hunyuan-video-t2v-720p/transformers" ]
-    fileList = [ [], ["config.json", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json"] + computeList(text_encoder_filename) , [],  computeList(transformer_filename) ]
+    fileList = [ [], ["config.json", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json"] + computeList(text_encoder_filename) , [],  computeList(transformer_filename) ]
     targetRoot = "ckpts/" 
     for sourceFolder, files in zip(sourceFolderList,fileList ):
         if len(files)==0:
@@ -142,18 +151,34 @@ offload.default_verboseLevel = verbose_level
 
 download_models(transformer_filename_i2v if use_image2video else transformer_filename_t2v, text_encoder_filename) 
 
-with open("./ckpts/hunyuan-video-t2v-720p/vae/config.json", "r", encoding="utf-8") as reader:
-    text = reader.read()
-vae_config= json.loads(text)
-# reduce time window used by the VAE for temporal splitting (former time windows is too large for 24 GB) 
-if vae_config["sample_tsize"] == 64:
-    vae_config["sample_tsize"] = 32 
-with open("./ckpts/hunyuan-video-t2v-720p/vae/config.json", "w", encoding="utf-8") as writer:
-    writer.write(json.dumps(vae_config))
+# with open("./ckpts/hunyuan-video-t2v-720p/vae/config.json", "r", encoding="utf-8") as reader:
+#     text = reader.read()
+# vae_config= json.loads(text)
+# # reduce time window used by the VAE for temporal splitting (former time windows is too large for 24 GB) 
+# if vae_config["sample_tsize"] == 64:
+#     vae_config["sample_tsize"] = 32 
+# with open("./ckpts/hunyuan-video-t2v-720p/vae/config.json", "w", encoding="utf-8") as writer:
+#     writer.write(json.dumps(vae_config))
 
 
+# def adapt_model(model):
 
-def setup_loras(pipe, lora_preselected, lora_dir, lora_preseleted_multiplier):
+    # "double_blocks.0.img_attn_qkv.weight._data" #[9 216, 3 072]
+    # "double_blocks.0.img_attn_qkv.bias" #[9 216]
+
+    # "double_blocks.0.img_mlp.fc1.weight._data"  #[12 288, 3 072]
+    # "double_blocks.0.img_mlp.fc2.weight._data"	#[3 072, 12 288]
+    # "single_blocks.0.linear1.bias" #[21 504]
+    # "single_blocks.0.linear2.bias"	#[3 072]
+    # "single_blocks.0.linear2.weight._data"  #[3 072, 15 360]
+    # "single_blocks.0.modulation.linear.bias"  #[9 216]
+ 	# "single_blocks.0.modulation.linear.weight" #[9 216, 3 072]
+    # "single_blocks.0.linear1.weight._data"  #[21 504, 3 072]
+
+  
+  
+
+def setup_loras(pipe, lora_preselected, lora_dir, lora_preseleted_multiplier, split_linear_modules_map = None):
     # lora_weight =["ckpts/arny_lora.safetensors"] # 'ohwx person' ,; 'wick'
     # lora_multi = [1.0]
     loras =[]
@@ -181,30 +206,30 @@ def setup_loras(pipe, lora_preselected, lora_dir, lora_preseleted_multiplier):
 
     if len(loras) > 0:
         loras_names = [ Path(lora).stem for lora in loras  ]
-        offload.load_loras_into_model(pipe.transformer, loras,  activate_all_loras=False) #lora_multiplier,
+        offload.load_loras_into_model(pipe.transformer, loras,  activate_all_loras=False, split_linear_modules_map = split_linear_modules_map) #lora_multiplier,
     return loras, loras_names, default_loras_choices, default_loras_multis_str
 
 
 def load_models(i2v,lora_preselected, lora_dir, lora_preseleted_multiplier ):
     download_models(transformer_filename_i2v if i2v else transformer_filename_t2v, text_encoder_filename) 
-    if profile == 5:
-        pinToMemory = False
-        partialPinning = False
-    else:    
-        pinToMemory =  True
-        import psutil
-        physical_memory= psutil.virtual_memory().total    
-        partialPinning = physical_memory <= 2**30 * 32 
 
-    hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(transformer_filename_i2v if i2v else transformer_filename_t2v, text_encoder_filename, attention_mode = attention_mode, pinToMemory = pinToMemory, partialPinning = partialPinning, args=args,  device="cpu") 
-    pipe = hunyuan_video_sampler.pipeline
-    pipe.transformer.any_compilation = len(compile)>0
+    if i2v:
+        from magic_141_video.infer_ti2v import init_magic_141_video
+        hunyuan_video_sampler = init_magic_141_video()
+        pipe = { "transformer" : hunyuan_video_sampler.model, "text_encoder_2" : hunyuan_video_sampler.text_encoder_2, "vae" : hunyuan_video_sampler.vae  }
+        pipe.update(offload.extract_models(hunyuan_video_sampler.text_encoder_vlm), "text_encoder")
+    else:
+        hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(transformer_filename_i2v if i2v else transformer_filename_t2v, text_encoder_filename, attention_mode = attention_mode, args=args,  device="cpu") #pinToMemory = pinToMemory, partialPinning = partialPinning,  
+        pipe = hunyuan_video_sampler.pipeline
+        pipe.transformer.any_compilation = len(compile)>0
 
     kwargs = { "extraModelsToQuantize": None}
     if profile == 2 or profile == 4:
         kwargs["budgets"] = { "transformer" : 100, "*" : 3000 }
 
-    loras, loras_names, default_loras_choices, default_loras_multis_str = setup_loras(pipe, lora_preselected, lora_dir, lora_preseleted_multiplier)
+    split_linear_modules_map = get_linear_split_map()
+    offload.split_linear_modules(pipe.transformer, split_linear_modules_map )
+    loras, loras_names, default_loras_choices, default_loras_multis_str = setup_loras(pipe, lora_preselected, lora_dir, lora_preseleted_multiplier, split_linear_modules_map)
     offloadobj = offload.profile(pipe, profile_no= profile, compile = compile, quantizeTransformer = quantizeTransformer, **kwargs)  
 
 
@@ -213,13 +238,19 @@ def load_models(i2v,lora_preselected, lora_dir, lora_preseleted_multiplier ):
 hunyuan_video_sampler, offloadobj,  loras, loras_names, default_loras_choices, default_loras_multis_str = load_models(use_image2video,lora_preselected, lora_dir, lora_preseleted_multiplier )
 gen_in_progress = False
 
+def get_auto_attention():
+    for attn in ["sage2","sage","sdpa"]:
+        if attn in attention_modes_supported:
+            return attn
+    return "sdpa"
+
 def get_default_steps_flow(fast_hunyan):
     return 6 if fast_hunyan else 30, 17.0 if fast_hunyan else 7.0 
 
 def generate_header(fast_hunyan, compile, attention_mode):
     header = "<H2 ALIGN=CENTER><SPAN> ----------------- "
     header += "Fast HunyuanVideo model" if fast_hunyan else "HunyuanVideo model" 
-    header += " (attention mode: " + attention_mode
+    header += " (attention mode: " + (attention_mode if attention_mode!="auto" else "auto/" + get_auto_attention() )
     if attention_mode not in attention_modes_supported:
         header += " -NOT INSTALLED-"
 
@@ -236,6 +267,7 @@ def apply_changes(  state,
                     attention_choice,
                     compile_choice,
                     profile_choice,
+                    vae_config_choice,
                     default_ui_choice ="t2v",
 ):
 
@@ -249,6 +281,7 @@ def apply_changes(  state,
                      "text_encoder_filename" : text_encoder_choices[text_encoder_choice],
                      "compile" : compile_choice,
                      "profile" : profile_choice,
+                     "vae_config" : vae_config_choice,
                      "default_ui" : default_ui_choice,
                        }
 
@@ -269,7 +302,7 @@ def apply_changes(  state,
 
     changes = []
     for k, v in server_config.items():
-        v_old = old_server_config[k]
+        v_old = old_server_config.get(k, None)
         if v != v_old:
             changes.append(k)
 
@@ -277,23 +310,18 @@ def apply_changes(  state,
     state["config_new"] = server_config
     state["config_old"] = old_server_config
 
-    global attention_mode, profile, compile, transformer_filename_t2v, transformer_filename_i2v, text_encoder_filename
+    global attention_mode, profile, compile, transformer_filename_t2v, transformer_filename_i2v, text_encoder_filename, vae_config
     attention_mode = server_config["attention_mode"]
     profile = server_config["profile"]
     compile = server_config["compile"]
     transformer_filename_t2v = server_config["transformer_filename"]
     transformer_filename_i2v = server_config["transformer_filename_i2v"]
     text_encoder_filename = server_config["text_encoder_filename"]
+    vae_config = server_config["vae_config"]
 
-    if  all(change in ["attention_mode"] for change in changes ):
+    if  all(change in ["attention_mode", "vae_config"] for change in changes ):
         if "attention_mode" in changes:
-            # quick attention mode update to avoid reinitializing everything
-            transformer = hunyuan_video_sampler.pipeline.transformer
-            transformer.attention_mode = attention_mode
-            for module in transformer.double_blocks:
-                module.attention_mode = attention_mode
-            for module in transformer.single_blocks:
-                module.attention_mode = attention_mode
+            pass
 
     else:
         hunyuan_video_sampler = None
@@ -378,6 +406,15 @@ def select_video(state , event_data: gr.EventData):
         state["selected"] = data.get("index",0)
     return 
 
+def expand_slist(slist, num_inference_steps ):
+    new_slist= []
+    inc =  len(slist) / num_inference_steps 
+    pos = 0
+    for i in range(num_inference_steps):
+        new_slist.append(slist[ int(pos)])
+        pos += inc
+    return new_slist
+
 
 def generate_video(
     prompt,
@@ -395,6 +432,7 @@ def generate_video(
     image_to_continue,
     video_to_continue,
     max_frames,
+    RIFLEx_setting,
     state,
     progress=gr.Progress() #track_tqdm= True
 
@@ -407,22 +445,33 @@ def generate_video(
 
     if hunyuan_video_sampler == None:
         raise gr.Error("Unable to generate a Video while a new configuration is being applied.")
-    if not attention_mode in attention_modes_supported:
+    if attention_mode == "auto":
+        attn = get_auto_attention()
+    elif attention_mode in attention_modes_supported:
+        attn = attention_mode
+    else:
         raise gr.Error(f"You have selected attention mode '{attention_mode}'. However it is not installed on your system. You should either install it or switch to the default 'sdpa' attention.")
 
+    transformer = hunyuan_video_sampler.pipeline.transformer
+    transformer.attention_mode = attn
+    for module in transformer.double_blocks:
+        module.attention_mode = attn
+    for module in transformer.single_blocks:
+        module.attention_mode = attn
 
     global gen_in_progress
     gen_in_progress = True
     temp_filename = None
     if use_image2video:
         if image_to_continue is not None:
-            PIL_image = Image.fromarray(np.uint8(image_to_continue)).convert('RGB')
-            with tempfile.NamedTemporaryFile("w+b", delete = False, suffix=".png") as fp: 
-                PIL_image.save(fp, format="png")
-                fp.close()
+            pass
+            # PIL_image = Image.fromarray(np.uint8(image_to_continue)).convert('RGB')
+            # with tempfile.NamedTemporaryFile("w+b", delete = False, suffix=".png") as fp: 
+            #     PIL_image.save(fp, format="png")
+            #     fp.close()
 
-            input_image_or_video_path = fp.name
-            temp_filename = input_image_or_video_path
+            # input_image_or_video_path = fp.name
+            # temp_filename = input_image_or_video_path
             # pipeline.num_input_frames = 1 
             # pipeline.max_frames = 1 
 
@@ -450,9 +499,19 @@ def generate_video(
             list_mult_choices_str = loras_mult_choices.split(" ")
             for i, mult in enumerate(list_mult_choices_str):
                 mult = mult.strip()
-                if not is_float(mult):                
-                    raise gr.Error(f"Lora Multiplier no {i+1} ({mult}) is invalid")
-                list_mult_choices_nums.append(float(mult))
+                if "," in mult:
+                    multlist = mult.split(",")
+                    slist = []
+                    for smult in multlist:
+                        if not is_float(smult):                
+                            raise gr.Error(f"Lora sub value no {i+1} ({smult}) in Multiplier definition '{multlist}' is invalid")
+                        slist.append(float(smult))
+                    slist = expand_slist(slist, num_inference_steps )
+                    list_mult_choices_nums.append(slist)
+                else:
+                    if not is_float(mult):                
+                        raise gr.Error(f"Lora Multiplier no {i+1} ({mult}) is invalid")
+                    list_mult_choices_nums.append(float(mult))
         if len(list_mult_choices_nums ) < len(loras_choices):
             list_mult_choices_nums  += [1.0] * ( len(loras_choices) - len(list_mult_choices_nums ) )
 
@@ -468,9 +527,45 @@ def generate_video(
     state["in_progress"] = True
     state["selected"] = 0
  
+    enable_riflex = RIFLEx_setting == 0 and video_length > (4* 24) or RIFLEx_setting == 1
+    # VAE Tiling
+    device_mem_capacity = torch.cuda.get_device_properties(0).total_memory / 1048576
+    vae = hunyuan_video_sampler.vae
+    if vae_config == 0:
+        if device_mem_capacity >= 24000:
+            use_vae_config = 1            
+        elif device_mem_capacity >= 16000:
+            use_vae_config = 3          
+        elif device_mem_capacity >= 12000:
+            use_vae_config = 4
+        else:
+            use_vae_config = 5
+    else:
+        use_vae_config = vae_config
 
+    if use_vae_config == 1:
+        sample_tsize = 32
+        sample_size = 256  
+    elif use_vae_config == 2:
+        sample_tsize = 64
+        sample_size = 192  
+    elif use_vae_config == 3:
+        sample_tsize = 32
+        sample_size = 192  
+    elif use_vae_config == 4:
+        sample_tsize = 16
+        sample_size = 256  
+    else:
+        sample_tsize = 16
+        sample_size = 192  
 
-   # TeaCache
+    vae.tile_sample_min_tsize = sample_tsize
+    vae.tile_latent_min_tsize = sample_tsize // vae.time_compression_ratio
+    vae.tile_sample_min_size = sample_size
+    vae.tile_latent_min_size = int(sample_size / (2 ** (len(vae.config.block_out_channels) - 1)))
+    vae.tile_overlap_factor = 0.25
+
+   # TeaCache   
     trans = hunyuan_video_sampler.pipeline.transformer
     trans.enable_teacache = tea_cache > 0
  
@@ -508,8 +603,9 @@ def generate_video(
             callback = build_callback(state, hunyuan_video_sampler.pipeline, progress, status, num_inference_steps)
 
             if use_image2video:
+                outputs = hunyuan_video_sampler.predict_step(image_to_continue, video_length, prompt)
                 # input_image_or_video_path
-                raise Exception("image 2 video not yet supported") #################
+                # raise Exception("image 2 video not yet supported") #################
             else:
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -529,6 +625,7 @@ def generate_video(
                         embedded_guidance_scale=embedded_guidance_scale,
                         callback = callback,
                         callback_steps = 1,
+                        enable_riflex= enable_riflex
 
                     )
                 except:
@@ -536,8 +633,13 @@ def generate_video(
                     if temp_filename!= None and  os.path.isfile(temp_filename):
                         os.remove(temp_filename)
                     offload.last_offload_obj.unload_all()
+                    # if compile:
+                    #     cache_size = torch._dynamo.config.cache_size_limit                                      
+                    #     torch.compiler.reset()
+                    #     torch._dynamo.config.cache_size_limit = cache_size
+
                     gc.collect()
-                    torch.cuda.empty_cache()                        
+                    torch.cuda.empty_cache()
                     raise gr.Error("The generation of the video has encountered an error: it is likely that you have unsufficient VRAM and you should therefore reduce the video resolution or its number of frames.")
 
 
@@ -595,18 +697,19 @@ def create_demo():
         state = gr.State({})
        
         if use_image2video:
-            gr.Markdown("<div align=center><H1>HunyuanVideo<SUP>GP</SUP> - AI Image To Video Generator</H1></div>")
+            gr.Markdown("<div align=center><H1>HunyuanVideo<SUP>GP</SUP> v5 - AI Image To Video Generator (<A HREF='https://github.com/deepbeepmeep/HunyuanVideoGP'>Updates</A> / <A HREF='https://github.com/Tencent/HunyuanVideo'>Original by Tencent</A>)</H1></div>")
         else:
-            gr.Markdown("<div align=center><H1>HunyuanVideo<SUP>GP</SUP> - AI Text To Video Generator</H1></div>")
+            gr.Markdown("<div align=center><H1>HunyuanVideo<SUP>GP</SUP> v5 - AI Text To Video Generator (<A HREF='https://github.com/deepbeepmeep/HunyuanVideoGP'>Updates</A> / <A HREF='https://github.com/Tencent/HunyuanVideo'>Original by Tencent</A>)</H1></div>")
 
-        gr.Markdown("<H2><B>GPU Poor version by DeepBeepMeep</B> (<A HREF='https://github.com/deepbeepmeep/HunyuanVideoGP'>Updates</A> / <A HREF='https://github.com/Tencent/HunyuanVideo'>Original by Tencent</A>).</H>")
+        gr.Markdown("<H2>This new release by <B>DeepBeepMeep</B> comes from Out Of this World as it breaks the laws of VRAM:</H2>")
+        gr.Markdown("<H2><I>-----> Thanks to a VRAM consumption / 3, you can now generate 12s of a 1280 * 720 video + Loras with 24 GB of VRAM at no quality loss</I></H2>")
 
         if use_image2video:
             pass
         else:
-            gr.Markdown("The resolution and the duration of the video will depend on the amount of VRAM your GPU has, for instance if you have 24 GB of VRAM (RTX 3090 / RTX 4090):")
-            gr.Markdown("- max 192 frames for 848 x 480 ")
-            gr.Markdown("- max 97 frames for 1280 x 720")
+            gr.Markdown("The resolution and the duration of the video will depend on the amount of VRAM your GPU has, for instance if you have 24 GB of VRAM (RTX 3090 / RTX 4090), the limits are as follows:")
+            gr.Markdown("- 848 x 480: 261 frames (10.5s) / 385 frames (16s) with Pytorch compilation (please note there is not point going beyond 10.5s duration as the videos will look redundant)")
+            gr.Markdown("- 1280 x 720: 192 frames (8s) / 261 frames (10.5s) with Pytorch compilation")
         gr.Markdown("In order to find the sweet spot you will need try different resolution / duration and reduce these if the app is hanging : in the very worst case one generation step should not take more than 2 minutes. If it is the case you may be running out of RAM / VRAM.")
         gr.Markdown("Please note that if your turn on compilation, the first generation step of the first video generation will be slow due to the compilation. Therefore all your tests should be done with compilation turned off.")
 
@@ -667,10 +770,12 @@ def create_demo():
                         return ""
                 attention_choice = gr.Dropdown(
                     choices=[
-                        ("Scale Dot Product Attention: default", "sdpa"),
+                        ("Auto : pick sage2 > sage > sdpa depending on what is installed", "auto"),
+                        ("Scale Dot Product Attention: default, always available", "sdpa"),
                         ("Flash" + check("flash")+ ": good quality - requires additional install (usually complex to set up on Windows without WSL)", "flash"),
                         ("Xformers" + check("xformers")+ ": good quality - requires additional install (usually complex, may consume less VRAM to set up on Windows without WSL)", "xformers"),
-                        ("Sage" + check("sage")+ ": 30% faster but worse quality - requires additional install (usually complex to set up on Windows without WSL)", "sage"),
+                        ("Sage" + check("sage")+ ": 30% faster but slightly worse quality - requires additional install (usually complex to set up on Windows without WSL)", "sage"),
+                        ("Sage2" + check("sage2")+ ": 40% faster but slightly worse quality - requires additional install (usually complex to set up on Windows without WSL)", "sage2"),
                     ],
                     value= attention_mode,
                     label="Attention Type",
@@ -685,7 +790,22 @@ def create_demo():
                     value= compile,
                     label="Compile Transformer (up to 50% faster and 30% more frames but requires Linux / WSL and Flash or Sage attention)",
                     interactive= not lock_ui_compile
-                 )                
+                 )              
+
+
+                vae_config_choice = gr.Dropdown(
+                    choices=[
+                ("Auto", 0),
+                ("32 frames * 256 px * 256 px (recommended 24+ GB VRAM)", 1),
+                ("64 frames * 192 px * 192 px (recommended 24+ GB VRAM)", 2),
+                ("32 frames * 192 px * 192 px (recommended 16+ GB VRAM)", 3),
+                ("16 frames * 256 px * 256 px (recommended 12+ GB VRAM)", 4),
+                ("16 frames * 192 px * 192 px ", 5),
+                    ],
+                    value= vae_config,
+                    label="VAE Tiling - reduce time of VAE decoding (if the last stage takes more than 2 minutes). The smaller the tile, the worse the quality. You may use larger tiles than recommended on shorter videos."
+                 )
+
                 profile_choice = gr.Dropdown(
                     choices=[
                 ("HighRAM_HighVRAM, profile 1: at least 48 GB of RAM and 24 GB of VRAM, the fastest for short videos a RTX 3090 / RTX 4090", 1),
@@ -739,18 +859,8 @@ def create_demo():
                         label="Resolution"
                     )
 
-                video_length = gr.Slider(5, 193, value=97, step=4, label="Number of frames (24 = 1s)")
+                video_length = gr.Slider(5, 337, value=97, step=4, label="Number of frames (24 = 1s)")
 
-                    # video_length = gr.Dropdown(
-                    #     label="Video Length",
-                    #     choices=[
-                    #         ("1.5s(41f)", 41),
-                    #         ("2s(65f)", 65),
-                    #         ("4s(97f)", 97),
-                    #         ("5s(129f)", 129),
-                    #     ],
-                    #     value=97,
-                    # )
                 num_inference_steps = gr.Slider(1, 100, value=  default_inference_steps, step=1, label="Number of Inference Steps")
                 seed = gr.Number(value=-1, label="Seed (-1 for random)")
                 max_frames = gr.Slider(1, 100, value=9, step=1, label="Number of input frames to use for Video2World prediction", visible=use_image2video and False) #########
@@ -781,7 +891,17 @@ def create_demo():
                                 ("Faster (x2.1 speed up)", 0.15), 
                             ],
                             value=default_tea_cache,
-                            label="Tea Cache acceleration (the faster the acceleration the higher the degradation of the quality of the video)"
+                            label="Tea Cache acceleration (the faster the acceleration the higher the degradation of the quality of the video. Consumes VRAM)"
+                        )
+
+                        RIFLEx_setting = gr.Dropdown(
+                            choices=[
+                                ("Auto (ON if Video longer than 4s)", 0),
+                                ("Always ON", 1), 
+                                ("Always OFF", 2), 
+                            ],
+                            value=0,
+                            label="RIFLex positional embedding to generate long video"
                         )
 
                 show_advanced.change(fn=lambda x: gr.Row(visible=x), inputs=[show_advanced], outputs=[advanced_row])
@@ -817,6 +937,7 @@ def create_demo():
                 image_to_continue,
                 video_to_continue,
                 max_frames,
+                RIFLEx_setting,
                 state
             ],
             outputs= [gen_status] #,state 
@@ -837,6 +958,7 @@ def create_demo():
                     attention_choice,
                     compile_choice,                            
                     profile_choice,
+                    vae_config_choice,
                     default_ui_choice,
                 ],
                 outputs= msg
@@ -857,7 +979,7 @@ if __name__ == "__main__":
 
     server_name = args.server_name
     if len(server_name) == 0:
-        server_name = os.getenv("SERVER_NAME", "0.0.0.0")
+        server_name = os.getenv("SERVER_NAME", "localhost")
 
         
     demo = create_demo()

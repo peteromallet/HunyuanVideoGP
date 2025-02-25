@@ -17,6 +17,17 @@
 
 
 ## News
+* 02/25/2025: Version 5.0: **Out Of this World Release by DeepBeepMeep that lands only in HunyuanVideo GP: VRAM laws have been broken as VRAM consumption has been divided by 3 and 20%-50% faster at no quality loss !**
+
+*You can now generate videos that lasts up to 10s of 1280x720 and 16s of 848x480 with 24 GB of VRAM with Loras and no quantization !!!*
+
+Welcome to low VRAM GPUs owners as from now on you can generate multiseconds videos.
+
+Many thanks to RIFLEx (https://github.com/thu-ml/RIFLEx) and their very good released timing, for their positional embeddign breakthrough that allows generating videos longer than up to 10s that doesn't look like still life.
+
+Please note that although there will be still sufficient VRAM left, generating video longer than 10s with Hunyuan current models is useless as the videos starts to get redundant/
+
+
 * 02/11/2025: Version 4.0 Quality of life features: fast abort video generation, detect automatically attention modes not supported, you can now change video engine parameters without having to restart the app
 * 02/11/2025: Version 3.5 optimized lora support (reduced VRAM requirements and faster). You can now generate 1280x720 97 frames with Loras in 3 minutes only in the fastest mode
 * 02/10/2025: Version 3.4 New --fast and --fastest switches to automatically get the best performance
@@ -29,7 +40,7 @@
 * 12/22/2024: Version 1.0 First release
 
 ## Features
-*GPU Poor version by **DeepBeepMeep**. This great video generator can now run smoothly on a 12 GB to 24 GB GPU.*
+*GPU Poor version by **DeepBeepMeep**. This great video generator can now run smoothly on any GPU.*
 
 This version has the following improvements over the original Hunyuan Video model:
 - Reduce greatly the RAM requirements and VRAM requirements
@@ -59,7 +70,8 @@ You will find the original Hunyuan Video repository here: https://github.com/Ten
 We provide an `environment.yml` file for setting up a Conda environment.
 Conda's installation instructions are available [here](https://docs.anaconda.com/free/miniconda/index.html).
 
-This app has been tested on Python 3.10 / Pytorch 2.51 / Cuda 12.4.
+This app has been tested on Python 3.10 / Pytorch 2.5.1 - 2.6.0  / Cuda 12.4.\
+(Pytorch compilation will not properly work for long video on Pytorch 2.5.1)
 
 ```shell
 # 1 - conda. Prepare and activate a conda environment
@@ -69,7 +81,9 @@ conda activate HunyuanVideo
 # OR
 
 # 1 - venv. Alternatively create a python 3.10 venv and then do the following
-pip install torch==2.5.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu124
+pip install torch==2.5.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu124  # if pytorch 2.5.1
+#or 
+pip install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu124  # if pytorch 2.6.0
 
 
 # 2. Install pip dependencies
@@ -81,19 +95,26 @@ python -m pip install flash-attn==2.7.2.post1
 # 3.2 optional Sage attention support (30% faster, easy to install on Linux but much harder on Windows)
 python -m pip install sageattention==1.0.6 
 
+# or for Sage Attention 2 (40% faster, sorry only manual compilation for the moment)
+git pull https://github.com/thu-ml/SageAttention
+cd sageattention 
+pip install -e .
+
 # 3.3 optional Xformers attention support (same speed as sdpa attention but lower VRAM requirements, easy to install on Linux but much harder on Windows)
 python -m pip install xformers==0.0.29
 
 ```
 
 Note that *Flash attention* and *Sage attention* are quite complex to install on Windows but offers a better memory management (and consequently longer videos) than the default *sdpa attention*.
-Likewise *Pytorch Compilation* will work on Windows only if you manage to install Triton. It is quite a complex process I will try to provide a script in the future.
+Likewise *Pytorch Compilation* will work on Windows only if you manage to install Triton. It is quite a complex process (see below for links).
 
 ### Ready to use python wheels for Windows users
 I provide here links to simplify the installation for Windows users with Python 3.10 / Pytorch 2.51 / Cuda 12.4. As I am not hosting these files I won't be able to provide support neither guarantee they do what they should do.
 - Triton attention (needed for *pytorch compilation* and *Sage attention*)
 ```
-pip install https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl  # triton for pytorch >=2.4.0
+pip install https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl # triton for pytorch 2.6.0
+#or 
+pip install https://github.com/woct0rdho/triton-windows/releases/download/v3.2.0-windows.post9/triton-3.2.0-cp310-cp310-win_amd64.whl # triton for pytorch 2.6.0
 ```
 - Xformers attention
 ```
@@ -102,7 +123,10 @@ pip install https://download.pytorch.org/whl/cu124/xformers-0.0.29.post1-cp310-c
 
 - Sage attention
 ```
-pip install https://github.com/sdbds/SageAttention-for-windows/releases/download/2.0.1/sageattention-2.0.1+cu124torch2.5.1-cp310-cp310-win_amd64.whl 
+pip install https://github.com/sdbds/SageAttention-for-windows/releases/download/2.0.1/sageattention-2.0.1+cu124torch2.5.1-cp310-cp310-win_amd64.whl # for pytorch 2.5.1
+# Or
+pip install https://github.com/deepbeepmeep/SageAttention/raw/refs/heads/main/releases/sageattention-2.1.0-cp310-cp310-win_amd64.whl # for pytorch 2.6.0 (experimental, if it works, otherwise you you will need to install and compile manually, see above) 
+ 
 ```
 
 ## Run the application
@@ -118,6 +142,8 @@ You can also pre activate some loras and specify their corresponding multipliers
 ```bash
 python gradio_server.py --lora-weight lora.safetensors --lora-multiplier 1
 ```
+
+For each activated Lora, you may specify one float number that corresponds to its weight, alternatively you may specify a list of floats separated by a "," that gives the evolution of this Lora over the steps. For instance let's assume there are 30 denoising steps and the multiplier is *0.9,0.8,0.7* then for the steps ranges 0-9, 10-19 and 20-29 the Lora multiplier will be respectively 0.9, 0.8 and 0.7.
 
 
 You can find prebuilt Loras on https://civitai.com/ or build them with tools such kohya or onetrainer.
@@ -160,7 +186,8 @@ python gradio_server.py --attention sage --compile
 --fast : start the app by loading Fast Hunyuan Video generator (faster but lower quality) + sage attention + teacache x2 
 --compile : turn on pytorch compilation\
 --fastest : shortcut for --fast + --compile\
---attention mode: force attention mode among, sdpa, flash, sage and xformers
+--attention mode: force attention mode among, sdpa, flash, sage and xformers\
+--vae-mode: 0-5, defalt(0) : VAE tiling to be used for latents decoding
 
 ### Profiles (for power users only)
 You can choose between 5 profiles, these will try to leverage the most your hardware, but have little impact for HunyuanVideo GP:

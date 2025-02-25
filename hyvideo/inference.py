@@ -448,7 +448,7 @@ class HunyuanVideoSampler(Inference):
 
         return pipeline
 
-    def get_rotary_pos_embed(self, video_length, height, width):
+    def get_rotary_pos_embed(self, video_length, height, width, enable_riflex = False):
         target_ndim = 3
         ndim = 5 - 2
         # 884
@@ -492,6 +492,8 @@ class HunyuanVideoSampler(Inference):
             theta=self.args.rope_theta,
             use_real=True,
             theta_rescale_factor=1,
+            L_test = (video_length - 1) // 4 + 1,
+            enable_riflex = enable_riflex
         )
         return freqs_cos, freqs_sin
 
@@ -510,6 +512,7 @@ class HunyuanVideoSampler(Inference):
         embedded_guidance_scale=None,
         batch_size=1,
         num_videos_per_prompt=1,
+        enable_riflex = False,
         **kwargs,
     ):
         """
@@ -624,7 +627,7 @@ class HunyuanVideoSampler(Inference):
         # Build Rope freqs
         # ========================================================================
         freqs_cos, freqs_sin = self.get_rotary_pos_embed(
-            target_video_length, target_height, target_width
+            target_video_length, target_height, target_width, enable_riflex
         )
         n_tokens = freqs_cos.shape[0]
 

@@ -88,9 +88,10 @@ class IndividualTokenRefinerBlock(nn.Module):
         # Apply QK-Norm if needed
         q = self.self_attn_q_norm(q).to(v)
         k = self.self_attn_k_norm(k).to(v)
-
+        qkv_list = [q, k, v]
+        del q,k
         # Self-Attention
-        attn = attention(q, k, v, mode="torch", attn_mask=attn_mask)
+        attn = attention( qkv_list, mode="torch", attn_mask=attn_mask)
 
         x = x + apply_gate(self.self_attn_proj(attn), gate_msa)
 

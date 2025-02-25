@@ -178,11 +178,11 @@ class TextEncoder(nn.Module):
             raise ValueError(f"Unsupported text encoder type: {text_encoder_type}")
 
         if "llm" in text_encoder_type:
-
             from mmgp import offload
-            
+
             self.model= offload.fast_load_transformers_model(self.model_path) #, pinInMemory = True, partialPinning = True
-            self.model.final_layer_norm = self.model.norm
+            # self.model= offload.fast_load_transformers_model("vlm.sft", forcedConfigPath ="ckpts/text_encoder/config.json") #, pinInMemory = True, partialPinning = True
+            # self.model.final_layer_norm = self.model.norm
         
         else:
             self.model, self.model_path = load_text_encoder(

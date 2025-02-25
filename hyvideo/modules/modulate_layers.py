@@ -48,7 +48,23 @@ def modulate(x, shift=None, scale=None):
     else:
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+def modulate_(x, shift=None, scale=None):
 
+    if scale is None and shift is None:
+        return x
+    elif shift is None:
+        scale = scale + 1
+        scale = scale.unsqueeze(1)
+        return x.mul_(scale) 
+    elif scale is None:
+        return x + shift.unsqueeze(1)
+    else:
+        scale = scale + 1
+        scale = scale.unsqueeze(1)
+        # return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        torch.addcmul(shift.unsqueeze(1), x,  scale, out =x )
+        return x 
+    
 def apply_gate(x, gate=None, tanh=False):
     """AI is creating summary for apply_gate
 
@@ -67,7 +83,14 @@ def apply_gate(x, gate=None, tanh=False):
     else:
         return x * gate.unsqueeze(1)
 
-
+def apply_gate_and_accumulate_(accumulator, x, gate=None, tanh=False):
+    if gate is None:
+        return accumulator
+    if tanh:
+        return accumulator.addcmul_(x, gate.unsqueeze(1).tanh())   
+    else:
+        return accumulator.addcmul_(x, gate.unsqueeze(1))
+    
 def ckpt_wrapper(module):
     def ckpt_forward(*inputs):
         outputs = module(*inputs)

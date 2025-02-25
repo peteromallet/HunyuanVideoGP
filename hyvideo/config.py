@@ -143,6 +143,13 @@ def add_network_args(parser: argparse.ArgumentParser):
     default="",
     help="attention mode"
     )
+
+    group.add_argument(
+    "--vae-config",
+    type=str,
+    default="",
+    help="vae config mode"
+    )    
     # Main model
     group.add_argument(
         "--model",

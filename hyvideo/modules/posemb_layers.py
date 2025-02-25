@@ -1,6 +1,95 @@
 import torch
-from typing import Union, Tuple, List
+from typing import Union, Tuple, List, Optional
+import numpy as np
 
+
+###### Thanks to the RifleX project (https://github.com/thu-ml/RIFLEx/) for this alternative pos embed for long videos
+#  
+def get_1d_rotary_pos_embed_riflex(
+    dim: int,
+    pos: Union[np.ndarray, int],
+    theta: float = 10000.0,
+    use_real=False,
+    k: Optional[int] = None,
+    L_test: Optional[int] = None,
+):
+    """
+    RIFLEx: Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+
+    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim' and the end
+    index 'end'. The 'theta' parameter scales the frequencies. The returned tensor contains complex values in complex64
+    data type.
+
+    Args:
+        dim (`int`): Dimension of the frequency tensor.
+        pos (`np.ndarray` or `int`): Position indices for the frequency tensor. [S] or scalar
+        theta (`float`, *optional*, defaults to 10000.0):
+            Scaling factor for frequency computation. Defaults to 10000.0.
+        use_real (`bool`, *optional*):
+            If True, return real part and imaginary part separately. Otherwise, return complex numbers.
+        k (`int`, *optional*, defaults to None): the index for the intrinsic frequency in RoPE
+        L_test (`int`, *optional*, defaults to None): the number of frames for inference
+    Returns:
+        `torch.Tensor`: Precomputed frequency tensor with complex exponentials. [S, D/2]
+    """
+    assert dim % 2 == 0
+
+    if isinstance(pos, int):
+        pos = torch.arange(pos)
+    if isinstance(pos, np.ndarray):
+        pos = torch.from_numpy(pos)  # type: ignore  # [S]
+
+    freqs = 1.0 / (
+            theta ** (torch.arange(0, dim, 2, device=pos.device)[: (dim // 2)].float() / dim)
+    )  # [D/2]
+
+    # === Riflex modification start ===
+    # Reduce the intrinsic frequency to stay within a single period after extrapolation (see Eq. (8)).
+    # Empirical observations show that a few videos may exhibit repetition in the tail frames.
+    # To be conservative, we multiply by 0.9 to keep the extrapolated length below 90% of a single period.
+    if k is not None:
+        freqs[k-1] = 0.9 * 2 * torch.pi / L_test
+    # === Riflex modification end ===
+
+    freqs = torch.outer(pos, freqs)  # type: ignore   # [S, D/2]
+    if use_real:
+        freqs_cos = freqs.cos().repeat_interleave(2, dim=1).float()  # [S, D]
+        freqs_sin = freqs.sin().repeat_interleave(2, dim=1).float()  # [S, D]
+        return freqs_cos, freqs_sin
+    else:
+        # lumina
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64     # [S, D/2]
+        return freqs_cis
+
+def identify_k( b: float, d: int, N: int):
+    """
+    This function identifies the index of the intrinsic frequency component in a RoPE-based pre-trained diffusion transformer.
+
+    Args:
+        b (`float`): The base frequency for RoPE.
+        d (`int`): Dimension of the frequency tensor
+        N (`int`): the first observed repetition frame in latent space
+    Returns:
+        k (`int`): the index of intrinsic frequency component
+        N_k (`int`): the period of intrinsic frequency component in latent space
+    Example:
+        In HunyuanVideo, b=256 and d=16, the repetition occurs approximately 8s (N=48 in latent space).
+        k, N_k = identify_k(b=256, d=16, N=48)
+        In this case, the intrinsic frequency index k is 4, and the period N_k is 50.
+    """
+
+    # Compute the period of each frequency in RoPE according to Eq.(4)
+    periods = []
+    for j in range(1, d // 2 + 1):
+        theta_j = 1.0 / (b ** (2 * (j - 1) / d))
+        N_j = round(2 * torch.pi / theta_j)
+        periods.append(N_j)
+
+    # Identify the intrinsic frequency whose period is closed to N（see Eq.(7)）
+    diffs = [abs(N_j - N) for N_j in periods]
+    k = diffs.index(min(diffs)) + 1
+    N_k = periods[k-1]
+    return k, N_k
 
 def _to_tuple(x, dim=2):
     if isinstance(x, int):
@@ -167,8 +256,13 @@ def apply_rotary_emb(
         cos, sin = cos.to(xq.device), sin.to(xq.device)
         # real * cos - imag * sin
         # imag * cos + real * sin
-        xq_out = (xq.float() * cos + rotate_half(xq.float()) * sin).type_as(xq)
-        xk_out = (xk.float() * cos + rotate_half(xk.float()) * sin).type_as(xk)
+        xq_dtype = xq.dtype
+        xq_out = xq.to(torch.float)
+        xq = None        
+        xq_out = (xq_out * cos + rotate_half(xq_out) * sin).to(xq_dtype)
+        xk_out = xk.to(torch.float)
+        xk = None
+        xk_out = (xk_out * cos + rotate_half(xk_out) * sin).to(xq_dtype)
     else:
         # view_as_complex will pack [..., D/2, 2](real) to [..., D/2](complex)
         xq_ = torch.view_as_complex(
@@ -188,6 +282,37 @@ def apply_rotary_emb(
     return xq_out, xk_out
 
 
+def _apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    head_first: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xk_out = None
+    if isinstance(freqs_cis, tuple):
+        cos, sin = reshape_for_broadcast(freqs_cis, xq, head_first)  # [S, D]
+        cos, sin = cos.to(xq.device), sin.to(xq.device)
+        # real * cos - imag * sin
+        # imag * cos + real * sin
+        xq_out = (xq.float() * cos + rotate_half(xq.float()) * sin).type_as(xq)
+        xk_out = (xk.float() * cos + rotate_half(xk.float()) * sin).type_as(xk)
+    else:
+        # view_as_complex will pack [..., D/2, 2](real) to [..., D/2](complex)
+        xq_ = torch.view_as_complex(
+            xq.float().reshape(*xq.shape[:-1], -1, 2)
+        )  # [B, S, H, D//2]
+        freqs_cis = reshape_for_broadcast(freqs_cis, xq_, head_first).to(
+            xq.device
+        )  # [S, D//2] --> [1, S, 1, D//2]
+        # (real, imag) * (cos, sin) = (real * cos - imag * sin, imag * cos + real * sin)
+        # view_as_real will expand [..., D/2](complex) to [..., D/2, 2](real)
+        xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3).type_as(xq)
+        xk_ = torch.view_as_complex(
+            xk.float().reshape(*xk.shape[:-1], -1, 2)
+        )  # [B, S, H, D//2]
+        xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3).type_as(xk)
+
+    return xq_out, xk_out
 def get_nd_rotary_pos_embed(
     rope_dim_list,
     start,
@@ -196,6 +321,9 @@ def get_nd_rotary_pos_embed(
     use_real=False,
     theta_rescale_factor: Union[float, List[float]] = 1.0,
     interpolation_factor: Union[float, List[float]] = 1.0,
+    k = 4,
+    L_test = 66,
+    enable_riflex = True
 ):
     """
     This is a n-d version of precompute_freqs_cis, which is a RoPE for tokens with n-d structure.
@@ -239,14 +367,23 @@ def get_nd_rotary_pos_embed(
     # use 1/ndim of dimensions to encode grid_axis
     embs = []
     for i in range(len(rope_dim_list)):
-        emb = get_1d_rotary_pos_embed(
-            rope_dim_list[i],
-            grid[i].reshape(-1),
-            theta,
-            use_real=use_real,
-            theta_rescale_factor=theta_rescale_factor[i],
-            interpolation_factor=interpolation_factor[i],
-        )  # 2 x [WHD, rope_dim_list[i]]
+        # emb = get_1d_rotary_pos_embed(
+        #     rope_dim_list[i],
+        #     grid[i].reshape(-1),
+        #     theta,
+        #     use_real=use_real,
+        #     theta_rescale_factor=theta_rescale_factor[i],
+        #     interpolation_factor=interpolation_factor[i],
+        # )  # 2 x [WHD, rope_dim_list[i]]
+
+
+        # === RIFLEx modification start ===
+        # apply RIFLEx for time dimension
+        if i == 0 and enable_riflex:
+            emb = get_1d_rotary_pos_embed_riflex(rope_dim_list[i], grid[i].reshape(-1), theta, use_real=True, k=k, L_test=L_test)
+        # === RIFLEx modification end ===
+        else:
+            emb = get_1d_rotary_pos_embed(rope_dim_list[i], grid[i].reshape(-1), theta, use_real=True, theta_rescale_factor=theta_rescale_factor[i],interpolation_factor=interpolation_factor[i],)
         embs.append(emb)
 
     if use_real:

@@ -47,6 +47,7 @@ from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
+from mmgp import offload
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -966,10 +967,13 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         if callback != None:
             callback(-1, None, None)
-
+        load_latent = True  #False
+        if load_latent:
+            timesteps = []
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                offload.set_step_no_for_lora(i)
                 if self.interrupt:
                     continue
                 import os
@@ -1064,6 +1068,11 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         if self.interrupt:
             return [None]
         
+        if load_latent:
+            latents = torch.load("latent.pt")
+        else:
+            torch.save(latents, "latent.pt")
+
         if not output_type == "latent":
             expand_temporal_dim = False
             if len(latents.shape) == 4:

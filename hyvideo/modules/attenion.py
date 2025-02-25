@@ -4,6 +4,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from importlib.metadata import version
+
+def clear_list(l):
+    for i in range(len(l)):
+        l[i] = None
 
 try:
     import flash_attn
@@ -34,16 +39,45 @@ try:
 except ImportError:
     sageattn_varlen_wrapper = None
 
+try:
+    from sageattention import sageattn
+    @torch.compiler.disable()
+    def sageattn_wrapper(
+            qkv_list,
+            attention_length
+        ):
+        q,k, v = qkv_list
+        padding_length = q.shape[1] -attention_length
+        q = q[:, :attention_length, :, : ]
+        k = k[:, :attention_length, :, : ]
+        v = v[:, :attention_length, :, : ]
+
+        o = sageattn(q, k, v, tensor_layout="NHD")
+        del q, k ,v
+        clear_list(qkv_list)
+
+        if padding_length > 0:
+            o = torch.cat([o, torch.empty( (o.shape[0], padding_length, *o.shape[-2:]), dtype= o.dtype, device=o.device  ) ], 1)
+
+        return o
+
+except ImportError:
+    sageattn = None
+
 
 def get_attention_modes():
-    ret = ["sdpa"]
+    ret = ["sdpa", "auto"]
     if flash_attn != None:
         ret.append("flash")
     if memory_efficient_attention != None:
         ret.append("xformers")
     if sageattn_varlen_wrapper != None:
         ret.append("sage")
+    if sageattn != None and version("sageattention").startswith("2") :
+        ret.append("sage2")
+
     return ret
+
 
 
 MEMORY_LAYOUT = {
@@ -52,6 +86,10 @@ MEMORY_LAYOUT = {
         lambda x: x.transpose(1, 2),
     ),
     "xformers": (
+        lambda x: x,
+        lambda x: x,
+    ),
+    "sage2": (
         lambda x: x,
         lambda x: x,
     ),
@@ -73,6 +111,27 @@ MEMORY_LAYOUT = {
     ),
 }
 
+@torch.compiler.disable()
+def sdpa_wrapper(
+        qkv_list,
+        attention_length
+    ):
+    q,k, v = qkv_list
+    padding_length = q.shape[2] -attention_length
+    q = q[:, :, :attention_length, :]
+    k = k[:, :, :attention_length, :]
+    v = v[:, :, :attention_length, :]
+
+    o = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=None, is_causal=False
+    )
+    del q, k ,v
+    clear_list(qkv_list)
+
+    if padding_length > 0:
+        o = torch.cat([o, torch.empty( (*o.shape[:2], padding_length, o.shape[-1]), dtype= o.dtype, device=o.device  ) ], 2)
+
+    return o
 
 def get_cu_seqlens(text_mask, img_len):
     """Calculate cu_seqlens_q, cu_seqlens_kv using text_mask and img_len
@@ -101,9 +160,7 @@ def get_cu_seqlens(text_mask, img_len):
 
 
 def attention(
-    q,
-    k,
-    v,
+    qkv_list,
     mode="flash",
     drop_rate=0,
     attn_mask=None,
@@ -137,12 +194,15 @@ def attention(
         torch.Tensor: Output tensor after self attention with shape [b, s, ad]
     """
     pre_attn_layout, post_attn_layout = MEMORY_LAYOUT[mode]
+    q , k , v = qkv_list
+    clear_list(qkv_list)
+    del qkv_list
     padding_length = 0
-    if attn_mask == None and mode == "sdpa": 
-        padding_length  = q.shape[1] - cu_seqlens_q
-        q = q[:, :cu_seqlens_q, ... ]
-        k = k[:, :cu_seqlens_kv, ... ]
-        v = v[:, :cu_seqlens_kv, ... ]
+    # if attn_mask == None and mode == "sdpa": 
+    #     padding_length  = q.shape[1] - cu_seqlens_q
+    #     q = q[:, :cu_seqlens_q, ... ]
+    #     k = k[:, :cu_seqlens_kv, ... ]
+    #     v = v[:, :cu_seqlens_kv, ... ]
 
     q = pre_attn_layout(q)
     k = pre_attn_layout(k)
@@ -156,15 +216,25 @@ def attention(
         )
         
     elif mode == "sdpa":
-        if attn_mask is not None and attn_mask.dtype != torch.bool:
-            attn_mask = attn_mask.to(q.dtype)            
-        x = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
-        )
+        # if attn_mask is not None and attn_mask.dtype != torch.bool:
+        #     attn_mask = attn_mask.to(q.dtype)            
+        # x = F.scaled_dot_product_attention(
+        #     q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
+        # )
+        assert attn_mask==None
+        qkv_list = [q, k, v]
+        del q, k , v
+        x = sdpa_wrapper( qkv_list, cu_seqlens_q )
+
     elif mode == "xformers":
         x = memory_efficient_attention(
             q, k, v , attn_bias= attn_mask
         )
+
+    elif mode == "sage2":
+        qkv_list = [q, k, v]
+        del q, k , v
+        x = sageattn_wrapper(qkv_list, cu_seqlens_q)
 
     elif mode == "sage":
         x = sageattn_varlen_wrapper(
