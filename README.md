@@ -27,7 +27,7 @@ Many thanks to RIFLEx (https://github.com/thu-ml/RIFLEx) and their very good rel
 
 Please note that although there will be still sufficient VRAM left, generating video longer than 10s with Hunyuan current models is useless as the videos starts to get redundant
 
-If you have already installed HunyuanVideoGPgi, you will need to run *pip install -r requirements.txt*. Upgrading to python 2.6.0 and the corresponding attention libaries is a plus for performance.
+If you have already installed HunyuanVideoGP, you will need to run *pip install -r requirements.txt*. Upgrading to python 2.6.0 and the corresponding attention libaries is a plus for performance.
 
 * 02/11/2025: Version 4.0 Quality of life features: fast abort video generation, detect automatically attention modes not supported, you can now change video engine parameters without having to restart the app
 * 02/11/2025: Version 3.5 optimized lora support (reduced VRAM requirements and faster). You can now generate 1280x720 97 frames with Loras in 3 minutes only in the fastest mode
