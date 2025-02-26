@@ -967,7 +967,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         if callback != None:
             callback(-1, None, None)
-        load_latent = True  #False
+        load_latent = True
+        load_latent = False
+
         if load_latent:
             timesteps = []
         # if is_progress_bar:
