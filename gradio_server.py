@@ -20,6 +20,8 @@ from hyvideo.modules.models import get_linear_split_map
 from mmgp import offload, safetensors2, profile_type 
 import torch
 import gc
+from PIL import Image
+import numpy as np
 
 attention_modes_supported = get_attention_modes()
 
@@ -214,24 +216,37 @@ def load_models(i2v,lora_preselected, lora_dir, lora_preseleted_multiplier ):
     download_models(transformer_filename_i2v if i2v else transformer_filename_t2v, text_encoder_filename) 
 
     if i2v:
-        from magic_141_video.infer_ti2v import init_magic_141_video
+        from hyvideo.inference import init_magic_141_video
         hunyuan_video_sampler = init_magic_141_video()
-        pipe = { "transformer" : hunyuan_video_sampler.model, "text_encoder_2" : hunyuan_video_sampler.text_encoder_2, "vae" : hunyuan_video_sampler.vae  }
-        pipe.update(offload.extract_models(hunyuan_video_sampler.text_encoder_vlm), "text_encoder")
+        pipe = { 
+            "transformer": hunyuan_video_sampler.model, 
+            "text_encoder_2": hunyuan_video_sampler.text_encoder_2, 
+            "vae": hunyuan_video_sampler.vae,
+            "text_encoder": hunyuan_video_sampler.text_encoder
+        }
     else:
-        hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(transformer_filename_i2v if i2v else transformer_filename_t2v, text_encoder_filename, attention_mode = attention_mode, args=args,  device="cpu") #pinToMemory = pinToMemory, partialPinning = partialPinning,  
+        hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(
+            transformer_filename_i2v if i2v else transformer_filename_t2v, 
+            text_encoder_filename, 
+            attention_mode=attention_mode, 
+            args=args, 
+            device="cpu"
+        )
         pipe = hunyuan_video_sampler.pipeline
-        pipe.transformer.any_compilation = len(compile)>0
+        pipe.transformer.any_compilation = len(compile) > 0
 
-    kwargs = { "extraModelsToQuantize": None}
+    kwargs = {"extraModelsToQuantize": None}
     if profile == 2 or profile == 4:
-        kwargs["budgets"] = { "transformer" : 100, "*" : 3000 }
+        kwargs["budgets"] = {"transformer": 100, "*": 3000}
 
     split_linear_modules_map = get_linear_split_map()
-    offload.split_linear_modules(pipe.transformer, split_linear_modules_map )
-    loras, loras_names, default_loras_choices, default_loras_multis_str = setup_loras(pipe, lora_preselected, lora_dir, lora_preseleted_multiplier, split_linear_modules_map)
-    offloadobj = offload.profile(pipe, profile_no= profile, compile = compile, quantizeTransformer = quantizeTransformer, **kwargs)  
-
+    offload.split_linear_modules(pipe.transformer, split_linear_modules_map)
+    loras, loras_names, default_loras_choices, default_loras_multis_str = setup_loras(
+        pipe, lora_preselected, lora_dir, lora_preseleted_multiplier, split_linear_modules_map
+    )
+    offloadobj = offload.profile(
+        pipe, profile_no=profile, compile=compile, quantizeTransformer=quantizeTransformer, **kwargs
+    )
 
     return hunyuan_video_sampler, offloadobj, loras, loras_names, default_loras_choices, default_loras_multis_str
 
@@ -434,14 +449,10 @@ def generate_video(
     max_frames,
     RIFLEx_setting,
     state,
-    progress=gr.Progress() #track_tqdm= True
-
+    progress=gr.Progress()
 ):
     
-    from PIL import Image
-    import numpy as np
     import tempfile
-
 
     if hunyuan_video_sampler == None:
         raise gr.Error("Unable to generate a Video while a new configuration is being applied.")
@@ -462,28 +473,29 @@ def generate_video(
     global gen_in_progress
     gen_in_progress = True
     temp_filename = None
+    
+    input_images = None
+    
     if use_image2video:
-        if image_to_continue is not None:
-            pass
-            # PIL_image = Image.fromarray(np.uint8(image_to_continue)).convert('RGB')
-            # with tempfile.NamedTemporaryFile("w+b", delete = False, suffix=".png") as fp: 
-            #     PIL_image.save(fp, format="png")
-            #     fp.close()
-
-            # input_image_or_video_path = fp.name
-            # temp_filename = input_image_or_video_path
-            # pipeline.num_input_frames = 1 
-            # pipeline.max_frames = 1 
-
-        elif video_to_continue != None and len(video_to_continue) >0 :
-            input_image_or_video_path = video_to_continue
-            # pipeline.num_input_frames = max_frames
-            # pipeline.max_frames = max_frames
+        if image_to_continue is not None and len(image_to_continue) > 0:
+            # Convert gradio images to PIL
+            input_images = []
+            for img in image_to_continue:
+                if isinstance(img, dict) and "image" in img:
+                    input_images.append(Image.fromarray(img["image"]))
+                else:
+                    input_images.append(Image.fromarray(np.uint8(img)).convert('RGB'))
+            
+            # If no images were provided, raise an error
+            if len(input_images) == 0:
+                raise gr.Error("Please provide at least one image for image-to-video generation")
+        elif video_to_continue is not None and len(video_to_continue) > 0:
+            # Handle video input
+            raise gr.Error("Video to video generation is not yet supported")
         else:
-            return
+            raise gr.Error("Please provide at least one image for image-to-video generation")
     else:
-        input_image_or_video_path = None
-
+        input_images = None
 
     if len(loras) > 0:
         def is_float(element: any) -> bool:
@@ -512,8 +524,8 @@ def generate_video(
                     if not is_float(mult):                
                         raise gr.Error(f"Lora Multiplier no {i+1} ({mult}) is invalid")
                     list_mult_choices_nums.append(float(mult))
-        if len(list_mult_choices_nums ) < len(loras_choices):
-            list_mult_choices_nums  += [1.0] * ( len(loras_choices) - len(list_mult_choices_nums ) )
+        if len(list_mult_choices_nums) < len(loras_choices):
+            list_mult_choices_nums += [1.0] * (len(loras_choices) - len(list_mult_choices_nums))
 
         offload.activate_loras(hunyuan_video_sampler.pipeline.transformer, loras_choices, list_mult_choices_nums)
 
@@ -570,7 +582,7 @@ def generate_video(
     trans.enable_teacache = tea_cache > 0
  
     import random
-    if seed == None or seed <0:
+    if seed == None or seed < 0:
         seed = random.randint(0, 999999999)
 
     file_list = []
@@ -580,7 +592,7 @@ def generate_video(
     os.makedirs(save_path, exist_ok=True)
     prompts = prompt.replace("\r", "").split("\n")
     video_no = 0
-    total_video =  repeat_generation * len(prompts)
+    total_video = repeat_generation * len(prompts)
     abort = False
     start_time = time.time()
     for prompt in prompts:
@@ -598,14 +610,38 @@ def generate_video(
 
             video_no += 1
             status = f"Video {video_no}/{total_video}"
-            progress(0, desc=status + " - Encoding Prompt" )   
+            progress(0, desc=status + " - Encoding Prompt")   
             
             callback = build_callback(state, hunyuan_video_sampler.pipeline, progress, status, num_inference_steps)
 
             if use_image2video:
-                outputs = hunyuan_video_sampler.predict_step(image_to_continue, video_length, prompt)
-                # input_image_or_video_path
-                # raise Exception("image 2 video not yet supported") #################
+                gc.collect()
+                torch.cuda.empty_cache()
+                try:
+                    outputs = hunyuan_video_sampler.predict_step(
+                        input_images,  # Now passing a list of images
+                        video_length, 
+                        prompt,
+                        height=height,
+                        width=width,
+                        seed=seed,
+                        negative_prompt=negative_prompt,
+                        infer_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        flow_shift=flow_shift,
+                        embedded_guidance_scale=embedded_guidance_scale,
+                        callback=callback,
+                        callback_steps=1,
+                        enable_riflex=enable_riflex
+                    )
+                except Exception as e:
+                    gen_in_progress = False
+                    if temp_filename is not None and os.path.isfile(temp_filename):
+                        os.remove(temp_filename)
+                    offload.last_offload_obj.unload_all()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    raise gr.Error(f"The generation of the video has encountered an error: {str(e)}")
             else:
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -614,7 +650,7 @@ def generate_video(
                         prompt=prompt,
                         height=height,
                         width=width, 
-                        video_length=(video_length // 4)* 4 + 1 ,
+                        video_length=(video_length // 4)* 4 + 1,
                         seed=seed,
                         negative_prompt=negative_prompt,
                         infer_steps=num_inference_steps,
@@ -623,25 +659,18 @@ def generate_video(
                         flow_shift=flow_shift,
                         batch_size=1,
                         embedded_guidance_scale=embedded_guidance_scale,
-                        callback = callback,
-                        callback_steps = 1,
-                        enable_riflex= enable_riflex
-
+                        callback=callback,
+                        callback_steps=1,
+                        enable_riflex=enable_riflex
                     )
-                except:
+                except Exception as e:
                     gen_in_progress = False
-                    if temp_filename!= None and  os.path.isfile(temp_filename):
+                    if temp_filename is not None and os.path.isfile(temp_filename):
                         os.remove(temp_filename)
                     offload.last_offload_obj.unload_all()
-                    # if compile:
-                    #     cache_size = torch._dynamo.config.cache_size_limit                                      
-                    #     torch.compiler.reset()
-                    #     torch._dynamo.config.cache_size_limit = cache_size
-
                     gc.collect()
                     torch.cuda.empty_cache()
-                    raise gr.Error("The generation of the video has encountered an error: it is likely that you have unsufficient VRAM and you should therefore reduce the video resolution or its number of frames.")
-
+                    raise gr.Error(f"The generation of the video has encountered an error: {str(e)}")
 
             samples = outputs['samples']
             if samples != None:
@@ -668,24 +697,23 @@ def generate_video(
                     basis_video_path = os.path.join(os.getcwd(), "gradio_outputs", file_name)        
                     video_path = basis_video_path
                     while True:
-                        if  not Path(video_path).is_file():
+                        if not Path(video_path).is_file():
                             idx = 0
                             break
                         idx += 1
                         video_path = basis_video_path[:-4] + f"_{idx}" + ".mp4"
 
-
-                    save_video(video, video_path )
+                    save_video(video, video_path)
                     print(f"New video saved to Path: "+video_path)
                     file_list.append(video_path)
                     if video_no < total_video:
-                        yield  status
+                        yield status
                     else:
                         end_time = time.time()
                         yield f"Total Generation Time: {end_time-start_time:.1f}s"
             seed += 1
   
-    if temp_filename!= None and  os.path.isfile(temp_filename):
+    if temp_filename is not None and os.path.isfile(temp_filename):
         os.remove(temp_filename)
     gen_in_progress = False
 
@@ -705,23 +733,20 @@ def create_demo():
         gr.Markdown("<H2><I>-----> Thanks to a VRAM consumption / 3, you can now generate 12s of a 1280 * 720 video + Loras with 24 GB of VRAM at no quality loss</I></H2>")
 
         if use_image2video:
-            pass
+            gr.Markdown("The resolution and the duration of the video will depend on the amount of VRAM your GPU has. Image-to-video generation requires more VRAM than text-to-video.")
+            gr.Markdown("- 848 x 480: Up to 8s with 24 GB of VRAM")
+            gr.Markdown("- 1280 x 720: Up to 5s with 24 GB of VRAM")
         else:
             gr.Markdown("The resolution and the duration of the video will depend on the amount of VRAM your GPU has, for instance if you have 24 GB of VRAM (RTX 3090 / RTX 4090), the limits are as follows:")
             gr.Markdown("- 848 x 480: 261 frames (10.5s) / 385 frames (16s) with Pytorch compilation (please note there is not point going beyond 10.5s duration as the videos will look redundant)")
             gr.Markdown("- 1280 x 720: 192 frames (8s) / 261 frames (10.5s) with Pytorch compilation")
+        
         gr.Markdown("In order to find the sweet spot you will need try different resolution / duration and reduce these if the app is hanging : in the very worst case one generation step should not take more than 2 minutes. If it is the case you may be running out of RAM / VRAM.")
         gr.Markdown("Please note that if your turn on compilation, the first generation step of the first video generation will be slow due to the compilation. Therefore all your tests should be done with compilation turned off.")
 
+        header = gr.Markdown(generate_header(fast_hunyan, compile, attention_mode))
 
-        # css = """<STYLE>
-        #         h2 { width: 100%;  text-align: center; border-bottom: 1px solid #000; line-height: 0.1em; margin: 10px 0 20px;  } 
-        #         h2 span {background:#fff;  padding:0 10px; }</STYLE>"""
-        # gr.HTML(css)
-
-        header = gr.Markdown(generate_header(fast_hunyan, compile, attention_mode)  )            
-
-        with gr.Accordion("Video Engine Configuration - click here to change it", open = False):
+        with gr.Accordion("Video Engine Configuration - click here to change it", open=False):
             gr.Markdown("For the changes to be effective you will need to restart the gradio_server. Some choices below may be locked if the app has been launched by specifying a config preset.")
 
             with gr.Column():
@@ -834,10 +859,24 @@ def create_demo():
 
         with gr.Row():
             with gr.Column():
-                video_to_continue = gr.Video(label= "Video to continue", visible= use_image2video and False) #######  
-                image_to_continue = gr.Image(label= "Image as a starting point for a new video", visible=use_image2video)
+                video_to_continue = gr.Video(label="Video to continue", visible=use_image2video and False)
+                
+                # Replace the single image input with a gallery for multiple images
+                image_to_continue = gr.Gallery(
+                    label="Images for video generation (upload 1-2 images)",
+                    visible=use_image2video,
+                    allow_preview=True,
+                    preview=True,
+                    type="pil",
+                    elem_id="image_gallery"
+                ).style(grid=2, height="auto")
 
-                prompt = gr.Textbox(label="Prompts (multiple prompts separated by carriage returns will generate multiple videos)", value="A large orange octopus is seen resting on the bottom of the ocean floor, blending in with the sandy and rocky terrain. Its tentacles are spread out around its body, and its eyes are closed. The octopus is unaware of a king crab that is crawling towards it from behind a rock, its claws raised and ready to attack. The crab is brown and spiny, with long legs and antennae. The scene is captured from a wide angle, showing the vastness and depth of the ocean. The water is clear and blue, with rays of sunlight filtering through. The shot is sharp and crisp, with a high dynamic range. The octopus and the crab are in focus, while the background is slightly blurred, creating a depth of field effect.", lines=3)
+                prompt = gr.Textbox(
+                    label="Prompts (multiple prompts separated by carriage returns will generate multiple videos)", 
+                    value="A large orange octopus is seen resting on the bottom of the ocean floor, blending in with the sandy and rocky terrain. Its tentacles are spread out around its body, and its eyes are closed. The octopus is unaware of a king crab that is crawling towards it from behind a rock, its claws raised and ready to attack. The crab is brown and spiny, with long legs and antennae. The scene is captured from a wide angle, showing the vastness and depth of the ocean. The water is clear and blue, with rays of sunlight filtering through. The shot is sharp and crisp, with a high dynamic range. The octopus and the crab are in focus, while the background is slightly blurred, creating a depth of field effect.", 
+                    lines=3
+                )
+                
                 with gr.Row():
                     resolution = gr.Dropdown(
                         choices=[
@@ -859,11 +898,17 @@ def create_demo():
                         label="Resolution"
                     )
 
-                video_length = gr.Slider(5, 337, value=97, step=4, label="Number of frames (24 = 1s)")
+                video_length = gr.Slider(
+                    5, 
+                    337, 
+                    value=97 if not use_image2video else 77, 
+                    step=4, 
+                    label="Number of frames (24 = 1s)"
+                )
 
-                num_inference_steps = gr.Slider(1, 100, value=  default_inference_steps, step=1, label="Number of Inference Steps")
+                num_inference_steps = gr.Slider(1, 100, value=default_inference_steps, step=1, label="Number of Inference Steps")
                 seed = gr.Number(value=-1, label="Seed (-1 for random)")
-                max_frames = gr.Slider(1, 100, value=9, step=1, label="Number of input frames to use for Video2World prediction", visible=use_image2video and False) #########
+                max_frames = gr.Slider(1, 100, value=9, step=1, label="Number of input frames to use for Video2World prediction", visible=use_image2video and False)
     
 
                 loras_choices = gr.Dropdown(
@@ -907,17 +952,25 @@ def create_demo():
                 show_advanced.change(fn=lambda x: gr.Row(visible=x), inputs=[show_advanced], outputs=[advanced_row])
             
             with gr.Column():
-                gen_status = gr.Text(label="Status", interactive= False) 
+                gen_status = gr.Text(label="Status", interactive=False) 
                 output = gr.Gallery(
-                        label="Generated videos", show_label=False, elem_id="gallery"
-                    , columns=[3], rows=[1], object_fit="contain", height="auto", selected_index=0, interactive= False)
+                    label="Generated videos", 
+                    show_label=False, 
+                    elem_id="gallery", 
+                    columns=[3], 
+                    rows=[1], 
+                    object_fit="contain", 
+                    height="auto", 
+                    selected_index=0, 
+                    interactive=False
+                )
                 generate_btn = gr.Button("Generate")
                 abort_btn = gr.Button("Abort")
 
-        gen_status.change(refresh_gallery, inputs = [state], outputs = output )
+        gen_status.change(refresh_gallery, inputs=[state], outputs=output)
 
-        abort_btn.click(abort_generation,state,abort_btn )
-        output.select(select_video, state, None )
+        abort_btn.click(abort_generation, state, abort_btn)
+        output.select(select_video, state, None)
 
         generate_btn.click(
             fn=generate_video,
@@ -940,12 +993,11 @@ def create_demo():
                 RIFLEx_setting,
                 state
             ],
-            outputs= [gen_status] #,state 
-
+            outputs=[gen_status]
         ).then( 
             finalize_gallery,
             [state], 
-            [output , abort_btn]
+            [output, abort_btn]
         )
 
         apply_btn.click(

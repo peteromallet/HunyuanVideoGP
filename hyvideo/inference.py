@@ -684,3 +684,29 @@ class HunyuanVideoSampler(Inference):
         logger.info(f"Success, time: {gen_time}")
 
         return out_dict
+
+def init_magic_141_video():
+    """
+    Initialize the Image-to-Video sampler
+    
+    Returns:
+        HunyuanVideoI2VSampler: The initialized I2V sampler
+    """
+    from hyvideo.inference_i2v import HunyuanVideoI2VSampler
+    
+    # First initialize the regular text-to-video sampler
+    args = parse_args()
+    args.flow_reverse = True
+    
+    hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(
+        "ckpts/hunyuan-video-t2v-720p/transformers/hunyuan_video_720_quanto_int8.safetensors", 
+        "ckpts/text_encoder/llava-llama-3-8b-v1_1_quanto_int8.safetensors", 
+        attention_mode="auto", 
+        args=args, 
+        device="cpu"
+    )
+    
+    # Then create the I2V sampler from it
+    i2v_sampler = HunyuanVideoI2VSampler(hunyuan_video_sampler)
+    
+    return i2v_sampler
